@@ -1,0 +1,328 @@
+# YAML pipeline to deploy or update FUAM
+
+# Below are the required parameters
+parameters:
+- name: new_installation
+  displayName: Is this a new installation? If not read FUAM update notes.
+  type: boolean
+  default: true
+- name: azure_tenant_id
+  displayName: Azure Tenant ID
+  type: string
+  default: 00000000-0000-0000-0000-000000000000
+- name: azure_client_id
+  displayName: Client ID of service principal used for FUAM connections and deployment
+  type: string
+  default: 00000000-0000-0000-0000-000000000000
+- name: azure_client_secret
+  displayName: Client Secret of service principal used for FUAM connections and deployment
+  type: string
+  default: "SECRETVALUE"
+- name: EntraObjectId
+  displayName: Object ID of Entra user to add as FUAM admin
+  type: string
+  default: 00000000-0000-0000-0000-000000000000
+- name: WorkspaceName
+  displayName: Name of the Fabric workspace to deploy FUAM to
+  type: string
+  default: "FUAM"
+- name: CapacityName
+  displayName: Name of the Fabric capacity new workspace uses
+  type: string
+  default: "CapacityName"
+
+# In order for this to work you must enter the below variables in one or more variable groups. 
+  # pbi_connection_name- Name of Power BI connection that gets created. Recommend set to "fuam pbi-service-api admin" (without quotes)
+  # pbibaseUrl - Base URL added to Power BI Connection. Set to "https://api.powerbi.com/v1.0/myorg/admin"
+  # pbiaudience - Audience added to Power BI Connection. Set to  "https://analysis.windows.net/powerbi/api"
+    # fabric_connection_name - Name of Power BI connection that gets created. Recommend set to  "fuam fabric-service-api admin" (without quotes)
+  # fabricbaseUrl - Base URL added to Fabric Connection. Set to  "https://api.fabric.microsoft.com/v1/admin"
+  # fabricaudience - Audience added to Fabric Connection. Set to   "https://api.fabric.microsoft.com"
+
+
+# Feel free to create your own variable group or use the below
+variables:
+- group: fuam-ns
+
+trigger: none
+# In this pipeline I use a Microsoft-hosted agent.
+# To reference a self-hosted agent instead swap around the commented and uncommented references
+pool: 
+   vmImage: 'ubuntu-latest'
+  # name: 'FabPool'
+
+stages:
+
+- stage: CreateConnections
+  displayName: 'Create connections'
+  
+  jobs:
+  - job: 'CreateConnections'
+    displayName: 'Create FUAM connections'
+
+    steps:
+      - task: UsePythonVersion@0
+        displayName: 'Use Python 3.12'
+        inputs:
+          versionSpec: 3.12   
+
+      - task: PowerShell@2
+        displayName: 'Install necessary libraries'
+        inputs:
+          targetType: 'inline'
+          script: |
+            python -m pip install --upgrade pip
+            pip install ms-fabric-cli
+          pwsh: true 
+
+      - task: PowerShell@2
+        displayName: 'Authenticate as Service Principal for Fabric CLI'
+        inputs:
+          targetType: 'inline'
+          script: |
+            fab config set encryption_fallback_enabled true
+            fab auth login -u ${{parameters.azure_client_id}} -p ${{parameters.azure_client_secret}} --tenant ${{parameters.azure_tenant_id}} 
+          pwsh: true       
+
+      # Create Power BI connection if does not exist. Needs to be done before workspace is populated.
+      - task: PowerShell@2
+        displayName: 'Create pbi connection if it does not exist'
+        inputs:
+          targetType: 'inline'
+          script: |
+            # $pbiconnections = fab ls .connections | Select-String -Pattern "^'$($pbi_connection_name)'"
+            $pbiconnections = fab ls .connections | Select-String "$(pbi_connection_name)"
+            $pbiconnections
+
+            if ($pbiconnections) {
+                Write-Host "✅ Connection $(pbi_connection_name) already exists."
+            } else {
+                Write-Host "Creating Connection $(pbi_connection_name)."
+                fab create ".connections/$(pbi_connection_name).connection" -P "connectionDetails.type=WebForPipeline,connectionDetails.creationMethod=WebForPipeline.Contents,connectionDetails.parameters.baseUrl=$(pbibaseUrl),connectionDetails.parameters.audience=$(pbiaudience),credentialDetails.type=ServicePrincipal,credentialDetails.tenantId=${{ parameters.azure_tenant_id }},credentialDetails.servicePrincipalClientId=${{ parameters.azure_client_id }},credentialDetails.servicePrincipalSecret=${{ parameters.azure_client_secret }}"
+            }
+          pwsh: true        
+
+      # Create Fabric connection if does not exist. Needs to be done before workspace is populated.      
+      - task: PowerShell@2
+        displayName: 'Create Fabric connection if it does not exist'
+        inputs:
+          targetType: 'inline'
+          script: |
+            # $fabconnections = fab ls .connections | Select-String -Pattern "^'$($fabric_connection_name)'"
+            $fabconnections = fab ls .connections | Select-String "$(fabric_connection_name)"
+
+            if ($fabconnections) {
+                Write-Host "✅ Connection $(fabric_connection_name) already exists."
+            } else {
+                Write-Host "Creating Connection $(fabric_connection_name)."
+                fab create ".connections/$(fabric_connection_name).connection" -P "connectionDetails.type=WebForPipeline,connectionDetails.creationMethod=WebForPipeline.Contents,connectionDetails.parameters.baseUrl=$(fabricbaseUrl),connectionDetails.parameters.audience=$(fabricaudience),credentialDetails.type=ServicePrincipal,credentialDetails.tenantId=${{ parameters.azure_tenant_id }},credentialDetails.servicePrincipalClientId=${{ parameters.azure_client_id }},credentialDetails.servicePrincipalSecret=${{ parameters.azure_client_secret }}"
+            }
+          pwsh: true
+
+      # Add permissions for the specified Entra object id to the pbi connection if not already there
+      - task: PowerShell@2
+        displayName: 'Add permissions to the pbi connection'
+        inputs:
+          targetType: 'inline'
+          script: |
+            $permissions = fab acl get .connections/$(pbi_connection_name).Connection -q [*].principal.id | Select-String ${{parameters.EntraObjectId}}
+
+            if ($permissions) {
+                Write-Host "✅ Permissions for ${{parameters.EntraObjectId}} already exist on the Power BI connection."
+            } else {
+                Write-Host "Adding permissions for ${{parameters.EntraObjectId}} to the Power BI connection."
+
+                $pbiconnectionid = fab get .connections/$(pbi_connection_name).connection -q id
+
+                $body = @{
+                principal = @{
+                    id = "${{parameters.EntraObjectId}}"
+                    type = "User"  
+                }
+                role = "Owner"
+                } | ConvertTo-Json -Compress
+                
+                # Create a temp file path and rite with UTF-8 WITHOUT BOM
+                $tempFile = [System.IO.Path]::GetTempFileName() + ".json"
+                $utf8Encoding = New-Object System.Text.UTF8Encoding $false
+                [System.IO.File]::WriteAllText($tempFile, $body, $utf8Encoding)
+
+                fab api -X post "connections/$pbiconnectionid/roleAssignments" -H "Content-Type=application/json" -i $tempFile
+              }
+          pwsh: true   
+
+      # Add permissions for the specified Entra object id to the Fabric connection if not already there
+      - task: PowerShell@2
+        displayName: 'Add permissions to the Fabric connection'
+        inputs:
+          targetType: 'inline'
+          script: |
+            $permissions = fab acl get .connections/$(fabric_connection_name).Connection -q [*].principal.id | Select-String ${{parameters.EntraObjectId}}
+
+            if ($permissions) {
+                Write-Host "✅ Permissions for ${{parameters.EntraObjectId}} already exist on the Fabric connection."
+            } else {
+                Write-Host "Adding permissions for ${{parameters.EntraObjectId}} to the Fabric connection."
+
+                $fabricconnectionid = fab get .connections/$(fabric_connection_name).connection -q id
+
+                $body = @{
+                principal = @{
+                    id = "${{parameters.EntraObjectId}}"
+                    type = "User"  
+                }
+                role = "Owner"
+                } | ConvertTo-Json -Compress
+                
+                # Create a temp file path and rite with UTF-8 WITHOUT BOM
+                $tempFile = [System.IO.Path]::GetTempFileName() + ".json"
+                $utf8Encoding = New-Object System.Text.UTF8Encoding $false
+                [System.IO.File]::WriteAllText($tempFile, $body, $utf8Encoding)
+
+                fab api -X post "connections/$fabricconnectionid/roleAssignments" -H "Content-Type=application/json" -i $tempFile
+            }
+          pwsh: true
+
+- stage: WorkspaceManagement
+  displayName: 'Manage Workspace'
+  dependsOn: CreateConnections 
+
+  jobs:
+
+  - job: 'ManageWorkspace'
+    displayName: 'Create or updates ${{parameters.WorkspaceName}} workspace'
+
+    steps:
+      - task: UsePythonVersion@0
+        displayName: 'Use Python 3.12'
+        inputs:
+          versionSpec: 3.12   
+
+      - task: PowerShell@2
+        displayName: 'Install necessary libraries'
+        inputs:
+          targetType: 'inline'
+          script: |
+            python -m pip install --upgrade pip
+            pip install ms-fabric-cli
+          pwsh: true 
+
+      - task: PowerShell@2
+        displayName: 'Authenticate as Service Principal for Fabric CLI'
+        inputs:
+          targetType: 'inline'
+          script: |
+            fab config set encryption_fallback_enabled true
+            fab auth login -u ${{parameters.azure_client_id}} -p ${{parameters.azure_client_secret}} --tenant ${{parameters.azure_tenant_id}} 
+          pwsh: true       
+
+      # Will create new workspace if new installation
+      - task: PowerShell@2
+        displayName: 'Create the ${{parameters.WorkspaceName}} workspace with ms-fabric-cli'
+        condition: eq('${{ parameters.new_installation }}', true)
+        inputs:
+          targetType: 'inline'
+          script: |
+            fab create ${{parameters.WorkspaceName}}.Workspace -P capacityname=${{parameters.CapacityName}}
+          pwsh: true 
+
+      # Remove the exiting deploy_fuam notebook if this is not a new installation to ensure the latest version gets imported and run later in the pipeline
+      - task: PowerShell@2
+        displayName: 'Remove the exiting deploy_fuam notebook if this is not a new installation'
+        condition: eq('${{ parameters.new_installation }}', false)
+        inputs:
+          targetType: 'inline'
+          script: |
+            fab rm ${{parameters.WorkspaceName}}.Workspace/Deploy_FUAM.Notebook -f
+          pwsh: true           
+
+      - task: PowerShell@2
+        displayName: 'Add permissions to workspace'
+        inputs:
+          targetType: 'inline'
+          script: |
+            fab acl set ${{parameters.WorkspaceName}}.Workspace -I ${{parameters.EntraObjectId}} -R admin -f
+          pwsh: true 
+
+      # Get workspace id for multiple reuse      
+      - task: PowerShell@2
+        displayName: 'Get Workspace Id'
+        name: GetWorkspaceId  
+        inputs:
+          targetType: 'inline'
+          script: |
+            $WorkspaceId = fab get ${{parameters.WorkspaceName}}.Workspace -q id
+            Write-Host "##vso[task.setvariable variable=WorkspaceId;isOutput=true]$($WorkspaceId)"
+          pwsh: true
+
+- stage: RunNotebook
+  displayName: 'Import and Run Notebook'
+  dependsOn: WorkspaceManagement
+  jobs:
+
+  - job: 'ImportNotebook'
+    displayName: 'Import Notebook'
+    variables:
+      WorkspaceId: $[ stagedependencies.CreateWorkspace.CreateWorkspace.outputs['GetWorkspaceId.WorkspaceId'] ]
+    steps:
+
+    - task: PowerShell@2
+      displayName: 'Download the latest version of the Deploy_FUAM notebook from the release'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $notebookDir = ".\Deploy_FUAM.Notebook"
+          $outputFile = Join-Path $notebookDir "Deploy_FUAM.ipynb"
+          Invoke-WebRequest -Uri "$(DeployURL)" -Headers @{ Accept = "application/octet-stream" } -OutFile $outputFile
+        pwsh: true
+
+    - task: PowerShell@2
+      displayName: 'Install necessary libraries'
+      inputs:
+        targetType: 'inline'
+        script: |
+          python -m pip install --upgrade pip
+          pip install ms-fabric-cli
+        pwsh: true 
+
+    - task: PowerShell@2
+      displayName: 'Authenticate as Service Principal for Fabric CLI'
+      inputs:
+        targetType: 'inline'
+        script: |
+          fab config set encryption_fallback_enabled true          
+          fab auth login -u ${{parameters.azure_client_id}} -p ${{parameters.azure_client_secret}} --tenant ${{parameters.azure_tenant_id}} 
+        pwsh: true   
+
+    # Run script to import the FUAM notebook into the new workspace
+    - task: PowerShell@2
+      displayName: 'Run script to import the Deploy_FUAM and post_deployment notebooks into the new workspace'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $env:PYTHONIOENCODING = "utf-8"
+          fab import -f /${{parameters.WorkspaceName}}.Workspace/Deploy_FUAM.Notebook -i Deploy_FUAM.Notebook
+          fab import -f /${{parameters.WorkspaceName}}.Workspace/Deploy_FUAM_post_deployment.Notebook -i Deploy_FUAM_post_deployment.Notebook
+        pwsh: true
+
+    # Run the deployment notebook
+    - task: PowerShell@2
+      displayName: 'Run fab job run command to run the deploy FUAM notebook'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $env:PYTHONIOENCODING = "utf-8"
+          # Run the post-deployment notebook which contains all tasks up until refreshing SQL Endpoint for Config_Lakehouse
+          fab job run /${{parameters.WorkspaceName}}.Workspace/Deploy_FUAM.Notebook  -P _inlineInstallationEnabled:bool=true
+        pwsh: true     
+
+     # Run the deployment notebook
+    - task: PowerShell@2
+      displayName: 'Run fab job run command to run the post_deployment notebook in the new workspace'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $env:PYTHONIOENCODING = "utf-8"
+          # Run the post-deployment notebook which contains all tasks up until refreshing SQL Endpoint for Config_Lakehouse
+          fab job run /${{parameters.WorkspaceName}}.Workspace/Deploy_FUAM_post_deployment.Notebook  -P _inlineInstallationEnabled:bool=true
+        pwsh: true                
