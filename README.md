@@ -58,7 +58,7 @@ Add the following variables to your variable group:
 | `fabric_connection_name` | Name of the Fabric connection to create | `fuam fabric-service-api admin` |
 | `fabricbaseUrl` | Base URL for Fabric connection | `https://api.fabric.microsoft.com/v1/admin` |
 | `fabricaudience` | Audience for Fabric connection | `https://api.fabric.microsoft.com` |
-| `DeployURL` | URL to download the Deploy_FUAM notebook from the latest release | *(See FUAM repository releases)* |
+| `DeployURL` | URL to download the Deploy_FUAM notebook from the latest release | `https://raw.githubusercontent.com/microsoft/fabric-toolbox/main/monitoring/fabric-unified-admin-monitoring/scripts/Deploy_FUAM.ipynb` |
 
 ### Creating a Variable Group
 
