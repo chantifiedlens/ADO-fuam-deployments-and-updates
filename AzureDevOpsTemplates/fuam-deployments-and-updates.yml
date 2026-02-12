@@ -276,6 +276,50 @@ stages:
           Invoke-WebRequest -Uri "$(DeployURL)" -Headers @{ Accept = "application/octet-stream" } -OutFile $outputFile
         pwsh: true
 
+    # Add from notebookutils import notebook to first import cell
+    - task: PowerShell@2
+      displayName: 'Add notebookutils import notebook to the first cell that starts with import'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $filePath = ".\Deploy_FUAM.Notebook\Deploy_FUAM.ipynb"
+          $notebook = Get-Content $filePath -Raw | ConvertFrom-Json
+          
+          foreach ($cell in $notebook.cells) {
+              if ($cell.cell_type -eq "code" -and $cell.source.Count -gt 0) {
+                  $firstLine = $cell.source[0]
+                  if ($firstLine -like "*import*" -and $firstLine -notlike "*from notebookutils*") {
+                      $cell.source = @("from notebookutils import notebook`n") + $cell.source
+                      break
+                  }
+              }
+          }
+          
+          $notebook | ConvertTo-Json -Depth 100 | Set-Content $filePath
+        pwsh: true
+
+    # Run script to change original %%configure cell to raise SystemExit("Stopping notebook here")
+    - task: PowerShell@2
+      displayName: 'Run script to replace %%configure cell in the Deploy_FUAM notebook with SystemExit to prevent errors when running notebook in a new workspace without the necessary connections already set up'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $filePath = ".\Deploy_FUAM.Notebook\Deploy_FUAM.ipynb"
+          $notebook = Get-Content $filePath -Raw | ConvertFrom-Json
+          
+          foreach ($cell in $notebook.cells) {
+              if ($cell.cell_type -eq "code" -and $cell.source.Count -gt 0) {
+                  $firstLine = $cell.source[0]
+                  if ($firstLine -like "*%%configure -f*") {
+                      $cell.source = @("notebookutils.notebook.exit(`"Gracefully exiting`")")
+                  }
+              }
+          }
+          
+          $notebook | ConvertTo-Json -Depth 100 | Set-Content $filePath
+        pwsh: true  
+
+
     - task: PowerShell@2
       displayName: 'Install necessary libraries'
       inputs:
